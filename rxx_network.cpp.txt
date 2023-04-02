@@ -1,0 +1,2491 @@
+#include "rxx_network.h"
+
+#include <string>
+#include <iostream>
+#include <sstream>
+#include <random>
+#include <net/if.h>
+#include <arpa/inet.h>
+#include <sys/ioctl.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <ros/package.h>
+#include <iterator>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+
+#include "version/rbrain_version.h"
+#include "path_generation/bezier.h"
+
+#include "rxx_database/UiDataBase.h"
+
+
+
+NetWorkInterface::NetWorkInterface(void):
+local_controller_(""),
+local_thread_(nullptr){
+    file_path_ = ros::package::getPath("nav_startup");
+    file_path_ +="/maps/";
+    map_yaml_length_=0;
+    map_yaml_index_ =0;
+    map_pgm_length_ =0;
+    map_pgm_index_  =0;
+    map_pbstream_length_ = 0;
+    map_pbstream_index_ = 0;
+    map_name_length_=0;
+    map_name_index_ =0;
+    map_info_length_=0;
+    map_info_index_ =0;
+    map_cur_step_   =0;
+    map_file_name_ ="";
+    char* _home_path = getenv("HOME");
+    if(_home_path!=nullptr){
+        ui_file_path_ = std::string(_home_path);
+        if("/root" == ui_file_path_){
+            ui_file_path_ = "/home/rxx";
+        }
+        ui_file_path_ += "/.config/ui_config/maps/";
+    }else{
+        ui_file_path_ = "/home/rxx/.config/ui_config/maps/";
+    }
+
+    m_binited_ok = false;
+    map_yaml_file_  =nullptr;
+    map_pgm_file_   =nullptr;
+    map_pbstream_file_ = nullptr;
+    remote_controller_ip_= "";
+    update_map_status_ = true;
+    update_datebase_status_ = true;
+    charge_sequence_id_ = "";
+    offline_mapping_sequence_id_ = "";
+    path_sequence_id_ = "";
+    sensor_sequence_id_ = "";
+    swap_sequence_id_ = "";
+    body_path_task_type_ = false;
+    body_swap_task_type_ = false;
+    charge_task_type_ = false;
+    LoadRobotDevInfo();
+}
+
+NetWorkInterface::~NetWorkInterface(void){
+    if(local_thread_){
+        local_thread_->interrupt();
+        local_thread_->join();
+        boost::this_thread::sleep(boost::posix_time::millisec(200));
+        delete local_thread_;
+    }
+    local_thread_ = nullptr;
+}
+
+void NetWorkInterface::StopHttpService(void){
+    http_srv_.stop();
+
+}
+
+void NetWorkInterface::LoadRobotDevInfo(void){
+    ros::param::param<std::string>("~id",robot_dev_info_.id,"1");
+    ros::param::param<std::string>("~vehicle_id",robot_dev_info_.vehicle_id,"rbrain_xml");
+    ros::param::param<std::string>("~robot_note",robot_dev_info_.robot_note,"xc");
+    ros::param::param<std::string>("~model",robot_dev_info_.model,"diff");
+    ros::param::param<std::string>("~robot_ip",robot_ip_,"192.168.1.240");
+    ros::param::param<std::string>("~local_server_ip",local_server_ip,"192.168.1.240");
+    ros::param::param<int>("~local_server_port",local_server_port,50001);
+    ros::param::param<std::string>("~eth_name",m_eth_name,"wlp3s0");
+    ros::param::param<int>("~robot_port",robot_port_,1690);
+    ros::param::param<double>("~task_excute_timeout",task_excute_timeout_,1.0);
+    ros::param::param<double>("~pickup_distance_extend",pickup_distance_extend_,0.2);
+    ros::param::param<int>("~task_timeout_cnt",task_timeout_cnt_,3);
+    ros::param::param<int>("~http_timeout_usec", m_http_timeout_usec, 300000);
+    ros::param::param<int>("~http_timeout_sec", m_http_timeout_sec, 0);
+    ros::param::param<int>("~http_timeout_num", m_http_timeout_num, 3);
+
+    ros::param::param<bool>("~use_same_direction", m_buse_same_direction, true);
+
+    
+    
+    std::string tmp_robot_ip;
+    if (get_local_ip(m_eth_name, tmp_robot_ip))
+    {
+        RXX_LOG_INFO("get_local_ip %s:%s", m_eth_name.c_str(), tmp_robot_ip.c_str());
+        // robot_ip_ = tmp_robot_ip;
+    }
+    RXX_LOG_WARN("robot_ip ->%s   port_->%d",robot_ip_.c_str(),robot_port_);
+    robot_dev_info_.version = GetRbrainVesion();
+    robot_dev_info_.ret_code =0;
+    robot_dev_info_.err_msg = "";
+    if(pickup_distance_extend_ < 0){
+        pickup_distance_extend_ = 0;
+    }
+    AnalyzeJson::GetInstance().SetSameDirection(m_buse_same_direction);
+
+}
+
+
+
+bool NetWorkInterface::get_local_ip(const std::string &eth_inf, std::string& out_ip)
+{
+    int sd;
+    struct sockaddr_in sin;
+    struct ifreq ifr;
+
+    sd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (-1 == sd)
+    {
+        printf("socket error: %s\n", strerror(errno));
+        return false;
+    }
+
+    strncpy(ifr.ifr_name, eth_inf.c_str(), IFNAMSIZ);
+    ifr.ifr_name[IFNAMSIZ - 1] = 0;
+
+    // if error: No such device
+    if (ioctl(sd, SIOCGIFADDR, &ifr) < 0)
+    {
+        printf("ioctl error: %s\n", strerror(errno));
+        close(sd);
+        return false;
+    }
+
+    memcpy(&sin, &ifr.ifr_addr, sizeof(sin));
+    std::string tmpip(inet_ntoa(sin.sin_addr));
+    out_ip = tmpip;
+
+    close(sd);
+    return true;
+}
+
+
+bool NetWorkInterface::GetLocalPara()
+{
+    if (m_binited_ok)
+    {
+        return true;
+    }
+    DBWorkMode tmp_work_model;
+    if (!UiDataBase::GetInstance().GetWorkMode(tmp_work_model))
+    {
+        RXX_LOG_ERROR("GetWorkMode fail");
+        return false;
+    }
+    this->local_server_ip = tmp_work_model.server_ip;
+    this->local_server_port = tmp_work_model.server_port;
+    RXX_LOG_INFO("workmodel:%d ip:%s port:%d", tmp_work_model.work_mode, local_server_ip.c_str(), local_server_port);
+    m_binited_ok = true;
+    return true;
+}
+
+bool NetWorkInterface::CheckRemortHead()
+{
+    static bool s_offline_status = true;
+    httplib::Client http_client_(this->local_server_ip, this->local_server_port);
+    httplib::Headers _local_headers={
+      {"Accept-Encoding","gzip,deflate"},
+      {"Connection","close"}
+    };
+    http_client_.set_default_headers(_local_headers);
+    http_client_.set_connection_timeout(m_http_timeout_sec, m_http_timeout_usec);
+    http_client_.set_read_timeout(m_http_timeout_sec, m_http_timeout_usec);
+    http_client_.set_write_timeout(m_http_timeout_sec, m_http_timeout_usec);
+
+    static uint32_t g_http_check_num = 0;
+    Json::Value _root, _data;
+    _data["robot_ip"] = this->robot_ip_;
+    _data["robot_port"] = this->robot_port_;
+    _root["data"] = _data;
+    std::string _json_body = _root.toStyledString();
+    httplib::Result result = http_client_.Post("/rbrainrobot/heart_beat", \
+        _json_body.c_str(), _json_body.size(), "application/json");
+    if (result == nullptr) 
+    {
+        RXX_LOG_INFO("http_check_num:%d  http_timeout_num:%d", g_http_check_num, m_http_timeout_num);
+        http_client_.stop();
+        g_http_check_num++;
+        if (g_http_check_num >= m_http_timeout_num)
+        {
+            g_http_check_num = m_http_timeout_num;
+            FunctionCodeType function_code = ADD_VIRSUAL_OBSTACLE;
+            robot_api_->SetRobotFunctionCode(function_code, 1);
+            robot_api_->SetRcsStatus(false);
+            s_offline_status = false;
+            return false;
+        }
+        return true;
+    }
+    else {
+        g_http_check_num = 0;
+        http_client_.stop();
+        robot_api_->SetRcsStatus(true);
+        if (!s_offline_status)
+        {
+            FunctionCodeType function_code = ADD_VIRSUAL_OBSTACLE;
+            robot_api_->SetRobotFunctionCode(function_code, 0);
+        }
+        s_offline_status = true;
+        //RXX_LOG_INFO("[%s]", result->body.c_str());
+        //NormalResponses tmp_res;
+        //bool bresult = AnalyzeJson::GetInstance().JsonToNormalResponse(result->body, tmp_res);
+        //if (!bresult) {
+        //    RXX_LOG_INFO("%s not link to myself server %s:%d", this->robot_ip_.c_str(), local_server_ip.c_str(), local_server_port);
+        //    return false;
+        //    //robot_api_->StopTask();
+        //}
+    }
+    return true;
+}
+
+void NetWorkInterface::RobotSensorThreadRun(void){
+    ros::Rate loop(200);
+    uint32_t check_time_out = 0;
+    while (ros::ok())
+    {
+        loop.sleep();
+        ros::spinOnce();
+        if (check_time_out++ > 20)
+        {
+            check_time_out = 0;
+            if (!GetLocalPara())
+            {
+                RXX_LOG_ERROR("GetLocalPara fail wait.....");
+                continue;
+            }
+            CheckRemortHead();
+        }
+
+    }
+    http_srv_.stop();
+    RXX_LOG_INFO("RobotSensorThreadRun  exit");
+}
+
+bool NetWorkInterface::JudgeRobotKeyStatus(const httplib::Request& req,httplib::Response& res){
+    return true;
+    if( !req.has_header("robot_key") ){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "not robot_key";
+        return false;
+    }
+
+    std::string robot_key = req.get_header_value("robot_key");
+
+    {
+        std::unique_lock<std::mutex> lock(local_data_mtx_);
+        if( robot_key != local_controller_){
+            res.set_content(Json::Value().toStyledString(),"application/json");
+            res.status = 200;
+            res.reason = "robot_key is invaild";
+            return false;
+        }
+    }
+    return true;
+}
+
+
+void NetWorkInterface::GetRobotControlInfo(const httplib::Request& req, httplib::Response& res){
+    std::cout<<"GetRobotControlInfo"<<std::endl;
+    if(local_controller_.empty()){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "no controller now";
+        return ;
+    }
+    Json::Value _root = AnalyzeJson::GetInstance().ControllerIPInfoToJson(remote_controller_ip_);
+    res.set_content(_root.toStyledString(),"application/json");
+    res.status = 200;
+    res.reason = "OK";
+
+    
+}
+
+void NetWorkInterface::GetRobotTrafficControlParam(const httplib::Request& req, httplib::Response& res){
+    TrafficControlParam trafficControlParam;
+    robot_api_->GetTrafficControlParam(trafficControlParam);
+    Json::Value _root = AnalyzeJson::GetInstance().RobotTrafficControlParamToJson(trafficControlParam);
+    res.set_content(_root.toStyledString(),"application/json");
+    res.status = 200;
+    res.reason = "OK";
+}
+
+void NetWorkInterface::GetRobotRunStatus(const httplib::Request& req, httplib::Response& res){
+    CarAPIDevInfo robot_info;
+    robot_api_->GetDevInfo(robot_info);
+    RobotRunStatus _run_status;
+    SetRobotRunParm(robot_info,_run_status);
+    TrafficControlParam robot_param;
+    robot_api_->GetTrafficControlParam(robot_param);
+
+    Json::Value _root = AnalyzeJson::GetInstance().RobotRunStatusToJson(_run_status, robot_info, robot_param);
+//  Json::FastWriter().write(root);
+    res.set_content(_root.toStyledString(),"application/json");
+    res.status = 200;
+    res.reason = "OK";
+}
+
+
+void NetWorkInterface::GetRobotLaserData(const httplib::Request& req, httplib::Response& res){
+
+    sensor_msgs::PointCloud laser_point;
+    bool status = robot_api_->GetRobotLaserData(laser_point);
+    if(status == false){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "controller sensor transform faild";
+        return ;
+    }
+    
+    Json::Value _root = AnalyzeJson::GetInstance().RobotLaserDataToJson(laser_point);
+//  Json::FastWriter().write(root);
+    res.set_content(_root.toStyledString(),"application/json");
+    res.status = 200;
+    res.reason = "OK";
+}
+
+void NetWorkInterface::GetCurReflectors(const httplib::Request& req, httplib::Response& res)
+{
+    std::vector<SReflectorData> _reflectors;
+    bool bret = robot_api_->GetCurReflectors(_reflectors);
+    if(!bret)
+    {
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "GetCurReflectors faild";
+    }
+    else
+    {
+        Json::Value _root;
+        Json::Value robot_value;
+        robot_value["msg"] = "ok";
+        Json::Value _datas;
+        for(const auto &it:_reflectors)
+        {
+            Json::Value data;
+            data["x"] = it.x;
+            data["y"] = it.y;
+            data["ikey"] = it.ikey;
+            _datas.append(data);
+        }
+        robot_value["reflectors"] = _datas;
+        _root["data"] = robot_value;
+        res.set_content(_root.toStyledString(),"application/json");
+        res.status = 200;
+        res.reason = "OK";
+    }
+}
+
+void NetWorkInterface::SetReflectorSwitchStatus(const httplib::Request& req, httplib::Response& res)
+{
+    // if(JudgeRobotKeyStatus(req,res) == false){
+    //     return ;
+    // }
+    int istatus = 0;
+    bool status = AnalyzeJson::GetInstance().JsonToReflectorStatus(req.body, "reflectorSwitch", istatus);
+    RXX_LOG_WARN("SetReflectorSwitchStatus:%d",istatus);
+    if( status == false){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "robot SetReflectorSwitchStatus param invaild";
+        return ;
+    }
+
+    robot_api_->SetReflectorSwitchStatus(istatus);
+
+    res.set_content(AnalyzeJson::GetInstance().SuccessResponseToJson(),"application/json");
+    res.status = 200;
+    res.reason = "OK";
+}
+
+void NetWorkInterface::DeleteErrorReflector(const httplib::Request& req, httplib::Response& res)
+{
+    // if(JudgeRobotKeyStatus(req,res) == false){
+    //     return ;
+    // }
+    int ifeaturekey = 0;
+    bool status = AnalyzeJson::GetInstance().JsonToReflectorStatus(req.body, "featurekey", ifeaturekey);
+    if( status == false){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "robot DeleteErrorReflector param invaild";
+        return ;
+    }
+
+    robot_api_->DeleteErrorReflector(ifeaturekey);
+
+    res.set_content(AnalyzeJson::GetInstance().SuccessResponseToJson(),"application/json");
+    res.status = 200;
+    res.reason = "OK";
+}
+
+void NetWorkInterface::SaveReflectors(const httplib::Request& req, httplib::Response& res)
+{
+    // if(JudgeRobotKeyStatus(req,res) == false){
+    //     return ;
+    // }
+    int istatus = 0;
+    bool status = AnalyzeJson::GetInstance().JsonToReflectorStatus(req.body, "iSaveStatus", istatus);
+    if( status == false){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "robot SaveReflectors param invaild";
+        return ;
+    }
+
+    robot_api_->SaveReflectors();
+
+    res.set_content(AnalyzeJson::GetInstance().SuccessResponseToJson(),"application/json");
+    res.status = 200;
+    res.reason = "OK";
+}
+
+void NetWorkInterface::GetRobotMap(const httplib::Request& req, httplib::Response& res){
+
+    std::string pgm_body_file;
+    std::string yaml_body_file;
+    std::string pbstream_file;
+
+    robot_api_->GetRobotRealMap(pgm_body_file, yaml_body_file, pbstream_file);
+    std::string map_id_name = robot_api_->get_work_map_id();
+
+    uint32_t _pgm_file_size  = pgm_body_file.size();
+    uint32_t _yaml_file_size = yaml_body_file.size();
+    uint32_t _pbstream_file_size = pbstream_file.size();
+    uint32_t _map_id_size = map_id_name.size();
+
+    RXX_LOG_INFO("_pgm_file_size:%d _yaml_file_size:%d _pbstream_file_size:%d",
+        _pgm_file_size, _yaml_file_size, _pbstream_file_size);
+
+    char _size[4];
+    memcpy(_size,&_map_id_size,sizeof(_size));
+    std::string _map_file(_size,4);
+    _map_file += map_id_name;
+
+    memcpy(_size,&_yaml_file_size,sizeof(_size));
+     _map_file += std::string(_size,4)+yaml_body_file;
+
+    memcpy(_size,&_pgm_file_size,sizeof(_size));
+    _map_file += std::string(_size,4)+pgm_body_file;
+
+    memcpy(_size, &_pbstream_file_size, sizeof(_size));
+    _map_file += std::string(_size, 4) + pbstream_file;
+
+
+
+    res.set_header("Accept-Encoding","gzip");
+    res.set_header("Content-Type","application/octet-stream");
+    res.set_content_provider(
+        _map_file.size(), 
+        "application/octet-stream", 
+        [_map_file,res](size_t offset, size_t length, httplib::DataSink &sink) {
+
+            sink.write(_map_file.data()+offset, length);
+            // std::cout<<"          "<<length<<std::endl;
+            return true; 
+        },
+        [] { ;});
+}
+
+void NetWorkInterface::GetRobotTaskStatus(const httplib::Request& req, httplib::Response& res){
+    uint32_t task_state = 0;
+    bool task_cancel = false,task_error = false;
+    int32_t task_feedback = 0;
+    double residue_path = std::numeric_limits<double>::max();
+    TaskErrorInfo task_error_info;
+    robot_api_->GetCurTaskState(task_state,task_cancel);
+    robot_api_->GetMoveTaskFeedBack(task_feedback, residue_path);
+    task_error = robot_api_->GetTaskErrorStatus();
+    robot_api_->GetTaskErrorInfo(task_error_info);
+    Json::Value _root = AnalyzeJson::GetInstance().RobotTaksStateToJson(task_state, task_feedback, task_error, task_error_info, residue_path);
+    res.set_content(_root.toStyledString(),"application/json");
+    //RXX_LOG_INFO("%s", _root.toStyledString().c_str());
+    res.status = 200;
+    res.reason = "OK";
+    {
+        std::unique_lock<std::mutex> lock(task_timeout_mtx_);
+        if(task_state == 3 ){
+            task_timeout_.start = false;
+        }
+        task_timeout_.duration = 0;
+        task_timeout_.time_cnt = 0;
+        task_timeout_.ocur_timeout = false;
+    }
+}
+
+
+void NetWorkInterface::GetRobotDevStatusInfo(const httplib::Request& req, httplib::Response& res){
+    CarAPIDevInfo robot_info;
+    robot_api_->GetDevInfo(robot_info);
+    robot_dev_info_.version = robot_info.dev_version;
+    
+    Json::Value _root = AnalyzeJson::GetInstance().RobotInfoToJson(robot_dev_info_);
+    res.set_content(_root.toStyledString(),"application/json");
+    res.status = 200;
+    res.reason = "OK";
+}
+
+void NetWorkInterface::GetRobotRunPath(const httplib::Request& req, httplib::Response& res){
+    nav_msgs::Path robot_path;
+    bool result = robot_api_->GetRobotRemainPath(robot_path);
+    if(result==false){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "robot api get path failed";
+        return ;
+    }
+    Json::Value _root = AnalyzeJson::GetInstance().RobotPathToJson(robot_path);
+
+    res.set_content(_root.toStyledString(),"application/json");
+    res.status = 200;
+    res.reason = "OK";
+}
+
+
+void NetWorkInterface::RequestRobotControl(const httplib::Request& req, httplib::Response& res){
+    if(!local_controller_.empty()){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "robot already have controller";
+        return ;
+    }
+    remote_controller_ip_ = req.get_header_value("REMOTE_ADDR");
+    char _buf[200];
+    std::snprintf(_buf, sizeof(_buf), "%llu", (unsigned long long)ros::Time::now().toNSec());
+    std::string _name = std::string(_buf);
+
+    std::random_device _rand;
+    std::mt19937 _generator(_rand());
+    std::uniform_int_distribution<int> dis(1000, 9999);
+    _name += std::to_string( dis(_generator) );
+
+    local_controller_ = _name;
+    Json::Value _root = AnalyzeJson::GetInstance().ControllerResponseToJson(local_controller_);
+    res.set_content(_root.toStyledString(),"application/json");
+    res.status = 200;
+    res.reason = "OK";
+}
+
+void NetWorkInterface::ReleaseRobotControl(const httplib::Request& req, httplib::Response& res){
+    if( !req.has_header("robot_key") ){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "not robot_key";
+        return ;
+    }
+
+    std::string robot_key = req.get_header_value("robot_key");
+
+    {
+        std::unique_lock<std::mutex> lock(local_data_mtx_);
+        if( robot_key == local_controller_){
+            res.set_content(AnalyzeJson::GetInstance().SuccessResponseToJson(),"application/json");
+            res.status = 200;
+            res.reason = "ok";
+            local_controller_ = "";
+            remote_controller_ip_ = "";
+        }else{
+            res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+            res.status = 200;
+            res.reason = "robot_key is invaild";
+        }
+    }
+
+}
+
+
+void NetWorkInterface::SetRobotInitPose(const httplib::Request& req, httplib::Response& res){
+    if(JudgeRobotKeyStatus(req,res) == false){
+        return ;
+    }
+    CarAPIPose robot_pose;
+    bool status = AnalyzeJson::GetInstance().JsonToRobotInitPose(req.body, robot_pose);
+    if( status == false){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "robot init pose param invaild";
+        return ;
+    }
+    status = robot_api_->InitCarPose(robot_pose);
+    if( status == false){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "robot init faild";
+        return ;
+    }
+
+    res.set_content(AnalyzeJson::GetInstance().SuccessResponseToJson(),"application/json");
+    res.status = 200;
+    res.reason = "OK";
+}
+
+
+void NetWorkInterface::SetRobotRemoteVelocity(const httplib::Request& req, httplib::Response& res){
+    if(JudgeRobotKeyStatus(req,res) == false){
+        return ;
+    }
+
+    CarAPISpeed _velocity;
+    bool status = AnalyzeJson::GetInstance().JsonToRobotRemoteVelocity(req.body, _velocity);
+
+    if( status == false){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "robot remote velocity invaild";
+        return ;
+    }
+    status = robot_api_->SetRobotVelocity(_velocity);
+    if( status == false){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "robot remote velocity faild";
+        return ;
+    }
+
+    res.set_content(AnalyzeJson::GetInstance().SuccessResponseToJson(),"application/json");
+    res.status = 200;
+    res.reason = "OK";
+}
+
+void NetWorkInterface::SetRobotForkControl(const httplib::Request &req, httplib::Response &res)
+{
+    if(JudgeRobotKeyStatus(req,res) == false){
+        return ;
+    }
+
+    CarAPIFork _fork;
+    bool status = AnalyzeJson::GetInstance().JsonToRobotForkControl(req.body, _fork);
+
+    if( status == false){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "robot remote fork invaild";
+        return ;
+    }
+    status = robot_api_->SetRobotFork(_fork);
+    if( status == false){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "robot remote fork faild";
+        return ;
+    }
+
+    res.set_content(AnalyzeJson::GetInstance().SuccessResponseToJson(),"application/json");
+    res.status = 200;
+    res.reason = "OK";
+}
+
+
+void NetWorkInterface::SetRobotAutoCharge(const httplib::Request& req, httplib::Response& res){
+    if(JudgeRobotKeyStatus(req,res) == false){
+        return ;
+    }
+    std::string sequence_id = "";
+    bool body_task_type = false;
+    Json::Value root;
+    bool status = AnalyzeJson::GetInstance().JsonToBodySequenceIdAndType(req.body,root,sequence_id,body_task_type);
+    if( status == false){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "robot charger param invaild";
+        RXX_LOG_WARN("SetRobotAutoCharge not find sequence_id");
+        return ;
+    }
+    uint16_t charge_cmd = 0;
+    CarAPIPose _pose;
+    status = AnalyzeJson::GetInstance().JsonToChargerStatus(root,charge_cmd,_pose);
+
+    if( status == false || charge_cmd<=0 || charge_cmd >5){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "robot charger param invaild";
+        return ;
+    }
+    if(charge_sequence_id_ == sequence_id && \
+        body_task_type == charge_task_type_){
+        CarAPIRes response;
+        response.sub_cmd = charge_cmd;
+        response.result = 1;
+        Json::Value _response = AnalyzeJson::GetInstance().ChargeResponseToJson(response);
+        res.set_content(_response.toStyledString(),"application/json");
+        res.status = 200;
+        res.reason = "OK";
+        RXX_LOG_WARN("SetRobotAutoCharge same sequence_id :%d",sequence_id);
+        return;
+    }
+    charge_sequence_id_ = sequence_id;
+    charge_task_type_ = body_task_type;
+    CarAPIRes response;
+    status = robot_api_->SetRobotAutoCharge(charge_cmd,response,_pose);
+    if( status == false){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "robot charger faild";
+        return ;
+    }
+
+    Json::Value _response = AnalyzeJson::GetInstance().ChargeResponseToJson(response);
+    res.set_content(_response.toStyledString(),"application/json");
+    res.status = 200;
+    res.reason = "OK";
+}
+
+void NetWorkInterface::SetOfflineMapping(const httplib::Request& req, httplib::Response& res){
+    if(JudgeRobotKeyStatus(req,res) == false){
+        return ;
+    }
+    Json::Value _response;
+    CarAPIRes response;
+    RXX_LOG_INFO("SetOfflineMapping--->%s",req.body.c_str());
+    std::string sequence_id = "";
+    Json::Value root;
+    bool status = AnalyzeJson::GetInstance().JsonToBodySequenceId(req.body,root,sequence_id);
+    if(status == false){
+        response.result = 1;
+        response.sub_cmd = 0;
+        _response = AnalyzeJson::GetInstance().OfflineMappingResponseToJson(response);
+        res.set_content(_response.toStyledString(),"application/json");
+        res.status = 200;
+        res.reason = "robot offline mapping param invaild";
+        RXX_LOG_WARN("SetOfflineMapping not find sequence_id");
+        return ;
+    }
+    std::string map_id = "";
+    uint16_t offline_mapping_cmd = 0;
+    status = AnalyzeJson::GetInstance().JsonToOfflineMapping(root, offline_mapping_cmd,map_id);
+
+    if( status == false || offline_mapping_cmd<=0 || offline_mapping_cmd >7 || \
+        (map_id.empty() && (offline_mapping_cmd == 4 || \
+                offline_mapping_cmd == 6 ))){
+        RXX_LOG_WARN("map offline mapping command %d",offline_mapping_cmd);
+        response.result = 1;
+        response.sub_cmd = offline_mapping_cmd;
+        _response = AnalyzeJson::GetInstance().OfflineMappingResponseToJson(response);
+        res.set_content(_response.toStyledString(),"application/json");
+        res.status = 200;
+        res.reason = "robot offline mapping param invaild";
+        return ;
+    }
+    if(offline_mapping_cmd == 4 || 
+        offline_mapping_cmd == 6){
+        offline_map_id_ = map_id;
+    }
+    if(offline_mapping_cmd == 6){
+        std::string file_path = file_path_ + offline_map_id_ + ".pbstream";
+        struct stat _buffer;
+        int result_value = stat(file_path.c_str(),&_buffer);
+        if( result_value != 0){
+            RXX_LOG_WARN("update mapping map %s is not exist result_value:%d",file_path.c_str(),result_value);
+            response.result = 1;
+            response.sub_cmd = offline_mapping_cmd;
+            _response = AnalyzeJson::GetInstance().OfflineMappingResponseToJson(response);
+            res.set_content(_response.toStyledString(),"application/json");
+            res.status = 200;
+            res.reason = "robot offline mapping faild";
+            return ;
+        }
+    }
+    if(offline_mapping_sequence_id_ == sequence_id && \
+        offline_mapping_cmd != 5 ){
+        response.result = 0;
+        response.sub_cmd = offline_mapping_cmd;
+        _response = AnalyzeJson::GetInstance().OfflineMappingResponseToJson(response);
+        res.set_content(_response.toStyledString(),"application/json");
+        res.status = 200;
+        res.reason = "OK";
+        RXX_LOG_WARN("SetOfflineMapping same sequence_id :%d",sequence_id);
+        return ;
+    }
+    offline_mapping_sequence_id_ = sequence_id;
+
+    status = robot_api_->SetRobotOfflineMapping(offline_mapping_cmd,response,map_id);
+    if( status == false){
+        response.result = 1;
+        response.sub_cmd = offline_mapping_cmd;
+        _response = AnalyzeJson::GetInstance().OfflineMappingResponseToJson(response);
+        res.set_content(_response.toStyledString(),"application/json");
+        res.status = 200;
+        res.reason = "robot offline mapping faild";
+        return ;
+    }
+    if( offline_mapping_cmd == 5 && \
+        response.result == 100 && \
+        status == true){
+        auto result = fork();
+        RXX_LOG_WARN("fork pid :%d",result);
+        if( result == 0){
+            setpgrp();
+            system("sync");
+            std::string _command ="cp " + file_path_ + offline_map_id_+".pgm "+\
+                                    ui_file_path_+ offline_map_id_ + ".pgm";
+            RXX_LOG_INFO("offline mapping --->%s",_command.c_str());
+            system(_command.c_str());
+            _command ="cp " + file_path_ + offline_map_id_+".yaml "+\
+                                    ui_file_path_+ offline_map_id_ + ".yaml";
+            RXX_LOG_INFO("offline mapping--->%s",_command.c_str());
+            system(_command.c_str());
+            _command = "cp " + file_path_ + offline_map_id_ + ".pbstream " +\
+                            ui_file_path_ + offline_map_id_ +".pbstream";
+            RXX_LOG_INFO("offline mapping--->%s",_command.c_str());
+            system(_command.c_str());
+            system("sync");
+            _exit(0);
+        }else if(result < 0){
+            res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+            res.status = 200;
+            res.reason = "robot offline mapping faild";
+            return ;
+        }else{
+            int pid_status;
+            waitpid(result,&pid_status,0);
+            robot_api_->SetWorkMapId(offline_map_id_,false);
+        }
+    }
+
+    _response = AnalyzeJson::GetInstance().OfflineMappingResponseToJson(response);
+    res.set_content(_response.toStyledString(),"application/json");
+    res.status = 200;
+    res.reason = "OK";
+}
+
+void NetWorkInterface::SetOnlineMapping(const httplib::Request& req, httplib::Response& res){
+
+    if( !req.has_header("robot_key") ){
+        // res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 500;
+        res.reason = "not robot_key";
+        return ;
+    }
+
+    uint16_t online_mapping_cmd = 0;
+    bool status = AnalyzeJson::GetInstance().JsonToOnlineMapping(req.body, online_mapping_cmd);
+
+    if( status == false || online_mapping_cmd<=0 || online_mapping_cmd >4){
+        // res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 500;
+        res.reason = "robot online mapping param invaild";
+        return ;
+    }
+    CarAPIRes response;
+    std::string map_info_pgm,map_info_yaml;
+    response.sub_cmd = online_mapping_cmd;
+    switch (online_mapping_cmd){
+        case 1:
+            robot_api_->StartMapping();
+            res.status = 200;
+            res.reason = "OK";
+            response.result = 0;
+            break;
+        case 2:
+            robot_api_->CancelMapping();
+            res.status = 200;
+            res.reason = "OK";
+            response.result = 0;
+            break;
+        case 3:
+            robot_api_->StopMapping();
+            res.status = 200;
+            res.reason = "OK";
+            response.result = 0;
+            break;
+        default:
+            // res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+            res.status = 500;
+            res.reason = "robot online mapping param invaild";
+            RXX_LOG_ERROR("===================================");
+            response.sub_cmd = online_mapping_cmd;
+            response.result = 1;
+            break;
+    }
+
+    Json::Value _response = AnalyzeJson::GetInstance().OnlineMappingResponseToJson(response);
+    res.set_content(_response.toStyledString(), "application/json");
+
+    return;
+}
+
+
+void NetWorkInterface::SetRobotMap(const httplib::Request& req, httplib::Response& res,const httplib::ContentReader &content_reader){
+    ResetMapInfo();
+    update_map_status_ = true;
+    std::string _map_info;
+    content_reader([this,&_map_info](const char* data,size_t data_length){
+        _map_info.append(data,data_length);
+        return true;
+    });
+
+    bool _status = false;
+    uint32_t rem_len = 0, index = 0,total_len = 0;
+    total_len = _map_info.size();
+    asycn_map_id_.clear();
+    while(_status == false && update_map_status_ == true && ros::ok()){
+        _status = UpdataMapping(_map_info.c_str()+index,total_len,rem_len,false);
+        index = _map_info.size() - rem_len;
+        total_len = rem_len;
+    }
+
+    if(update_map_status_ == true){
+        res.set_content(AnalyzeJson::GetInstance().SuccessResponseToJson(),"application/json");
+        res.reason = "OK";
+    }else{
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.reason = "cannot open .yaml and .pgm";
+    }
+    res.status = 200;
+}
+
+void NetWorkInterface::SetRobotFixPath(const httplib::Request& req, httplib::Response& res){
+    if(JudgeRobotKeyStatus(req,res) == false){
+        return ;
+    }
+    std::string sequence_id = "";
+    bool body_task_type = false;
+    Json::Value root;
+    bool status = AnalyzeJson::GetInstance().JsonToBodySequenceIdAndType(req.body,root,sequence_id,body_task_type);
+    if(status == false){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "OK";
+        RXX_LOG_WARN("SetRobotFixPath not find sequence_id");
+        return ;
+    }
+    RXX_LOG_ERROR("SetRobotFixPath-->%s",req.body.c_str());
+    MoveTaskCmd task_command;
+    status = AnalyzeJson::GetInstance().JsonToFixPaths(root, task_command);
+    if( status == false){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "robot json paths failed";
+        // RXX_LOG_WARN("fix path not match robot type cur:%d",robot_work_type);
+        return ;
+    }
+
+    RXX_LOG_ERROR("path_master_id:%d   path_sub_id%d", task_command.path_property.master_id.size(), \
+                    task_command.path_property.sub_id.size());
+    if(sequence_id == path_sequence_id_ && \
+        body_task_type == body_path_task_type_){
+        RXX_LOG_INFO("SetRobotFixPath type:%d sequence_id is same %d",body_task_type,sequence_id);
+        res.set_content(AnalyzeJson::GetInstance().SuccessResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "OK";
+        return ;
+    }
+    path_sequence_id_ = sequence_id;
+    body_path_task_type_ = body_task_type;
+    PickUpPathExtend(task_command);
+    RbrainErrMSG err_msg;
+    status = robot_api_->MoveTask(task_command,err_msg);//RbrainRobotApi类 是RbrainCarXP类、RbrainCarXC、RbrainCarXD的父类。
+                                                        //根据robot_api_所实际指向的对象是属于哪个类的就可以知道调用到的具体是哪个子类的
+                                                        // 该MoveTask虚函数了。
+                                                        //该函数是用来下发运动控制任务的。
+    if( status == false){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = err_msg.err_msg;
+        return ;
+    }
+    res.set_content(AnalyzeJson::GetInstance().SuccessResponseToJson(),"application/json");
+    res.status = 200;
+    res.reason = "OK";
+
+    {
+        std::unique_lock<std::mutex> lock(task_timeout_mtx_);
+        task_timeout_.start = true;
+        task_timeout_.duration = 0;
+        task_timeout_.time_cnt = 0;
+        task_timeout_.ocur_timeout = false;
+    }
+}
+
+
+void NetWorkInterface::SetRobotMoveBase(const httplib::Request& req, httplib::Response& res){
+    if(JudgeRobotKeyStatus(req,res) == false){
+        return ;
+    }
+
+    MoveTaskCmd task_command;
+    bool status = AnalyzeJson::GetInstance().JsonToMoveBasePoint(req.body, task_command);
+
+    if( status == false){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "robot json target pose failed";
+        return ;
+    }
+
+    RbrainErrMSG err_msg;
+    status = robot_api_->MoveTask(task_command,err_msg);
+    if( status == false){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = err_msg.err_msg;
+        return ;
+    }
+
+    res.set_content(AnalyzeJson::GetInstance().SuccessResponseToJson(),"application/json");
+    res.status = 200;
+    res.reason = "OK";
+}
+
+void NetWorkInterface::StopTask(const httplib::Request& req, httplib::Response& res)
+{
+    bool status = robot_api_->StopTask();
+    if (!status)
+    {
+        RbrainErrMSG err_msg;
+        err_msg.err_code = RBRAIN_ERROR_CODE_PATH_ACTIVEFAIL;
+        err_msg.err_msg = "StopTask fail";
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(), "application/json");
+        res.status = 200;
+        res.reason = err_msg.err_msg;
+        return;
+    }
+
+    res.set_content(AnalyzeJson::GetInstance().SuccessResponseToJson(), "application/json");
+    res.status = 200;
+    res.reason = "OK";
+}
+
+void NetWorkInterface::SetRobotSuspend(const httplib::Request& req, httplib::Response& res){
+    bool suspend = false;
+    bool status = AnalyzeJson::GetInstance().JsonToRobotSuspend(req.body, suspend);
+    if(!status){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "robot json suspend failed";
+        return ;
+    }
+    status = robot_api_->SetRobotSuspend(suspend);
+    if(!status){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "SetRobotSuspend api failed";
+        return ;
+    }
+
+    res.set_content(AnalyzeJson::GetInstance().SuccessResponseToJson(), "application/json");
+    res.status = 200;
+    res.reason = "OK";
+}
+
+void NetWorkInterface::SetRobotMaxSpeed(const httplib::Request& req, httplib::Response& res){
+    if(JudgeRobotKeyStatus(req,res) == false){
+        return ;
+    }
+
+    double max_speed = 0;
+    bool status = AnalyzeJson::GetInstance().JsonToRobotMaxVelocity(req.body, max_speed);
+
+    if( status == false){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "robot json max_speed failed";
+        return ;
+    }
+
+    status = robot_api_->SetMaxSpeed(max_speed);
+    if( status == false){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "set ma_speed api failed";
+        return ;
+    }
+
+    res.set_content(AnalyzeJson::GetInstance().SuccessResponseToJson(),"application/json");
+    res.status = 200;
+    res.reason = "OK";
+}
+
+
+void NetWorkInterface::SetRobotSensorDetector(const httplib::Request& req, httplib::Response& res){
+
+    std::string sequence_id = "";
+    Json::Value root;
+    bool status = AnalyzeJson::GetInstance().JsonToBodySequenceId(req.body,root,sequence_id);
+    if(status == false){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "robot json sensordetector failed";
+        RXX_LOG_INFO("SetRobotSensorDetector not find sequence_id");
+        return ;
+    }
+    int32_t direction = 0;
+    status = AnalyzeJson::GetInstance().JsonToRobotSensorDetector(root, direction);
+    if( status == false){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "robot json sensordetector failed";
+        return ;
+    }
+    SensorDetectorResult response;
+    if(sensor_sequence_id_ == sequence_id && \
+        direction != 55){
+        RXX_LOG_INFO("SetRobotSensorDetector sequence_id is same %d",sequence_id);
+        response.direction = direction;
+        response.success = 0;
+        response.code = 0;
+        Json::Value _response = AnalyzeJson::GetInstance().RobotSensorDetectorResultToJson(response);
+        res.set_content(_response.toStyledString(),"application/json");
+        res.status = 200;
+        res.reason = "OK";
+        return ;
+    }
+    sensor_sequence_id_ = sequence_id;
+
+
+    status = robot_api_->SetRobotSensorDetector(direction,response);
+    if( status == false){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "set sensordetector api failed";
+        return ;
+    }
+     Json::Value _response = AnalyzeJson::GetInstance().RobotSensorDetectorResultToJson(response);
+
+    res.set_content(_response.toStyledString(),"application/json");
+    res.status = 200;
+    res.reason = "OK";
+}
+
+
+void NetWorkInterface::SetRobotFunctionCode(const httplib::Request& req, httplib::Response& res){
+    FunctionCodeType function_code;
+    uint32_t _status;
+    bool status = AnalyzeJson::GetInstance().JsonToRobotFunctionCode(req.body,function_code, _status);
+
+    if( status == false){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "robot json sensordetector failed";
+        RXX_LOG_WARN("robot json sensordetector failed");
+        return ;
+    }
+    if(function_code == ROBOT_SYNC_SITE_PATH || \
+        function_code == ROBOT_SYNC_CAR || \
+        function_code == ROBOT_SYNC_MAP){
+        bool _result = UiDataBase::GetInstance().loadDataForSyncMap();
+        status = true;
+        if(_result == false){
+            RXX_LOG_WARN("loadDataForSyncMap error");
+            status = false;
+        }
+        _result = UiDataBase::GetInstance().loadDataForSyncSitePath();
+        if(_result == false){
+            RXX_LOG_WARN("loadDataForSyncSitePath error");
+            status = false;
+        }
+        _result = UiDataBase::GetInstance().loadDataForAreaGroup();
+        if(_result == false){
+            RXX_LOG_WARN("loadDataForAreaGroup error");
+            status = false;
+        }
+        if( status == false){
+             RXX_LOG_WARN("robot json function_code %d failed",function_code);
+            res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+            res.status = 200;
+            res.reason = "set robot virsual obstacle api failed";
+            RXX_LOG_WARN("set robot api failed");
+            return ;
+        }
+        res.set_content(AnalyzeJson::GetInstance().SuccessResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "OK";
+        return; 
+    }
+    status = robot_api_->SetRobotFunctionCode(function_code,_status);
+    if( status == false){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "set robot virsual obstacle api failed";
+        RXX_LOG_WARN("set robot api failed");
+        return ;
+    }
+
+    res.set_content(AnalyzeJson::GetInstance().SuccessResponseToJson(),"application/json");
+    res.status = 200;
+    res.reason = "OK";
+}
+
+void NetWorkInterface::SetRobotSyncMapInfo(const httplib::Request& req, httplib::Response& res,const httplib::ContentReader &content_reader){
+    ResetMapInfo();
+    update_map_status_ = true;
+    update_datebase_status_ = true;
+    std::string _map_info;
+    content_reader([this,&_map_info](const char* data,size_t data_length){
+        _map_info.append(data,data_length);
+        return true;
+    });
+    bool _status = false;
+    uint32_t rem_len = 0, index = 0,total_len = 0;
+    total_len = _map_info.size();
+    asycn_map_id_.clear();
+    date_base_map_info_.site_list.clear();
+    date_base_map_info_.path_list.clear();
+    date_base_map_info_.area_list.clear();
+    date_base_map_info_.group_list.clear();
+    date_base_map_info_.reservoir_area_list.clear();
+    date_base_map_info_.combine_reservoir_list.clear();
+    date_base_map_info_.path_area_list.clear();
+    date_base_map_info_.reflector_list.clear();
+    db_third_party_devices.clear();
+    db_wireless_tasks.clear();
+    db_safe_doors.clear();
+    db_robotarms.clear();
+    db_elevators.clear();
+    db_alarmTactics.clear();
+    while(_status == false && update_map_status_ == true && \
+            update_datebase_status_ == true && ros::ok()){
+        _status = UpdataMapping(_map_info.c_str()+index,total_len,rem_len,true);
+        index = _map_info.size() - rem_len;
+        total_len = rem_len;
+    }
+    
+    if(update_map_status_ == true && update_datebase_status_ == true){
+        res.set_content(AnalyzeJson::GetInstance().SuccessResponseToJson(),"application/json");
+        res.reason = "OK";
+    }else{
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        if(update_datebase_status_ == false)
+            res.reason = "databse insert failed";
+        else{
+            res.reason = "cannot open .yaml and .pgm";
+        }
+    }
+    res.status = 200;
+}
+
+void NetWorkInterface::SetRobotSyncParamInfo(const httplib::Request &req, httplib::Response &res)
+{
+    update_param_status = true;
+    db_param_infos.clear();
+    db_laser_range_infos.clear();
+    ParamInteractType type;
+
+    //RXX_LOG_WARN("json_body:%s******",req.body.c_str());
+    bool result = AnalyzeJson::GetInstance().JsonToRobotDataBaseParam(req.body, db_laser_range_infos, db_param_infos ,type);
+
+    if(result == true ){
+        if(type == ParamOnlyLaser)
+        {
+            for(auto &iter:db_laser_range_infos){
+                if(UiDataBase::GetInstance().removLaserRange(iter.id))
+                {
+                    result = UiDataBase::GetInstance().addLaserRange(iter);
+                    if(result == false){
+                        update_param_status == false;
+                        RXX_LOG_ERROR("insert DB LaserRange failed");
+                        break;
+                    }
+                }
+                else
+                {
+                    RXX_LOG_ERROR("delete DB LaserRange failed");
+                    result = false;
+                    break;
+                }
+            }
+        }
+        else if(type == ParamOnlyCar)
+        {
+            for(auto &iter:db_param_infos){
+                if(iter.cmd != 111 && iter.cmd != 112 && iter.cmd != 105) //过滤network_interface  server_interface car_sensors
+                {
+                    if(UiDataBase::GetInstance().deleteParam(iter.cmd))
+                    {
+                        result = UiDataBase::GetInstance().insertParam(iter.cmd, iter.content);
+                        if(result == false){
+                            update_param_status == false;
+                            RXX_LOG_ERROR("insert DB Param failed");
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        RXX_LOG_ERROR("delete DB Param failed");
+                        result = false;
+                        break;
+                    }
+                }
+            }
+        }
+        else if(type == ParamAll)
+        {
+            bool result_laser = true, result_param = true;
+            for(auto &iter:db_laser_range_infos){
+                if(UiDataBase::GetInstance().removLaserRange(iter.id))
+                {
+                    result_laser = UiDataBase::GetInstance().addLaserRange(iter);
+                    if(result_laser == false){
+                        update_param_status == false;
+                        RXX_LOG_ERROR("insert DB LaserRange failed");
+                        break;
+                    }
+                }
+                else
+                {
+                    RXX_LOG_ERROR("delete DB LaserRange failed");
+                    result_laser = false;
+                    break;
+                }
+            }
+            for(auto &iter:db_param_infos){
+                if(iter.cmd != 111 && iter.cmd != 112 && iter.cmd != 105) //过滤network_interface  server_interface car_sensors
+                {
+                    if(UiDataBase::GetInstance().deleteParam(iter.cmd))
+                    {
+                        result_param = UiDataBase::GetInstance().insertParam(iter.cmd, iter.content);
+                        if(result_param == false){
+                            update_param_status == false;
+                            RXX_LOG_ERROR("insert DB Param failed");
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        RXX_LOG_ERROR("delete DB Param failed");
+                        result_param = false;
+                        break;
+                    }
+                }
+            }
+            result = (result_laser && result_param);
+        }
+
+        if(update_param_status == true){
+            RXX_LOG_INFO("Write ParamInfo To DatesBase ok");
+            UiDataBase::GetInstance().StartGui();
+        }
+    }else{
+        RXX_LOG_WARN("JsonToRobotDataBaseParam failed");
+    }
+    if(update_param_status == true && result == true){
+        res.set_content(AnalyzeJson::GetInstance().SuccessResponseToJson(),"application/json");
+        res.reason = "OK";
+    }else{
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        if(update_param_status == false)
+            res.reason = "databse sync failed";
+    }
+    res.status = 200;
+}
+
+void NetWorkInterface::SetRobotTaskInfo(const httplib::Request& req, httplib::Response& res){
+    RXX_LOG_WARN("SetRobotTaskInfo>%s",req.body.c_str());
+
+    TaskInfoStatus task_info;
+    bool result = AnalyzeJson::GetInstance().JsonToRobotTaskInfo(req.body,task_info);
+    if( result == false){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "json param not match";
+        RXX_LOG_WARN("SetRobotTaskInfo  json param not match");
+        return ;
+    }
+    result = robot_api_->SetRobotTaskInfoStatus(task_info);
+    if( result == false){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(),"application/json");
+        res.status = 200;
+        res.reason = "set robot virsual obstacle api failed";
+        return ;
+    }
+
+    res.set_content(AnalyzeJson::GetInstance().SuccessResponseToJson(),"application/json");
+    res.status = 200;
+    res.reason = "OK";
+}
+
+void NetWorkInterface::GetRobotTaskInfoList(const httplib::Request& req, httplib::Response& res){
+    std::vector<TaskInfoStatus> task_status_list;
+    robot_api_->GetDispatchTaskStatus(task_status_list);
+    Json::Value _root = AnalyzeJson::GetInstance().TaskInfoStatusListToJson(task_status_list);
+    res.set_content(_root.toStyledString(),"application/json");
+    res.status = 200;
+    res.reason = "OK";
+}
+
+void NetWorkInterface::GetRobotCurTaskInfo(const httplib::Request& req, httplib::Response& res){
+    CurTaskInfoStatus task_status;
+    robot_api_->GetCurDispatchTaskStatus(task_status);
+    Json::Value _root = AnalyzeJson::GetInstance().CurTaskInfoStatusToJson(task_status);
+    res.set_content(_root.toStyledString(),"application/json");
+    res.status = 200;
+    res.reason = "OK";
+}
+
+
+void NetWorkInterface::ForceStopTask(const httplib::Request& req, httplib::Response& res){
+    uint8_t function_code = 0;
+    bool status = AnalyzeJson::GetInstance().JsonToForceStopTaskInfo(req.body, function_code);
+    if (!status){
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(), "application/json");
+        res.status = 200;
+        res.reason = "_robot_ip fail";
+        return;
+    }
+    if(function_code != 0){
+        RXX_LOG_WARN("ForceStopTask not match function_code:%s",function_code);
+        res.set_content(AnalyzeJson::GetInstance().FailedResponseToJson(), "application/json");
+        res.status = 200;
+        res.reason = "function_code not equal 0";
+        return;
+    }
+    robot_api_->ForceStopTask(function_code);
+    res.set_content(AnalyzeJson::GetInstance().SuccessResponseToJson(), "application/json");
+    res.status = 200;
+    res.reason = "OK";
+}
+
+
+void NetWorkInterface::RequestSwapMap(const httplib::Request& req, httplib::Response& res){
+    RXX_LOG_INFO("RequestSwapMap body:%s",req.body.c_str());
+    std::string sequence_id = "";
+    bool body_task_type = false;
+    Json::Value root;
+    bool status = AnalyzeJson::GetInstance().JsonToBodySequenceIdAndType(req.body,root,sequence_id,body_task_type);
+    if(status == false){
+        res.set_content(AnalyzeJson::GetInstance().NormalResultToJson(false,false), "application/json");
+        res.status = 200;
+        res.reason = "json failed error";
+        RXX_LOG_WARN("RequestSwapMap json sequence_id is empty");
+        return;
+    }
+    std::string map_id = "";
+    CarAPIPose init_pose;
+    status = AnalyzeJson::GetInstance().JsonToSwapMapInfo(root, map_id,init_pose);
+    if (!status){
+        res.set_content(AnalyzeJson::GetInstance().NormalResultToJson(false,false), "application/json");
+        res.status = 200;
+        res.reason = "json failed error";
+        return;
+    }
+    if(map_id.empty()){
+        RXX_LOG_WARN("RequestSwapMap map id is empty");
+        res.set_content(AnalyzeJson::GetInstance().NormalResultToJson(false,false), "application/json");
+        res.status = 200;
+        res.reason = "map id is empty";
+        return;
+    }
+    if(swap_sequence_id_ == sequence_id && \
+        body_swap_task_type_ == body_task_type){
+        RXX_LOG_WARN("RequestSwapMap body_task_type :%d same sequence_id :%d",body_task_type,sequence_id);
+        res.set_content(AnalyzeJson::GetInstance().NormalResultToJson(true,true), "application/json");
+        res.status = 200;
+        res.reason = "OK";
+        return ;
+    }
+    swap_sequence_id_ = sequence_id;
+    body_swap_task_type_ = body_task_type;
+
+    CarAPIDevInfo robot_info;
+    robot_api_->GetDevInfo(robot_info);
+    if(robot_info.map_id == map_id){
+        RXX_LOG_WARN("RequestSwapMap map id and robot id same");
+        res.set_content(AnalyzeJson::GetInstance().NormalResultToJson(false,false), "application/json");
+        res.status = 200;
+        res.reason = "robot map id and robot map id same";
+        return;
+    }
+
+    status = robot_api_->ShiftMapInfo(map_id,init_pose);
+    res.set_content(AnalyzeJson::GetInstance().NormalResultToJson(true,status), "application/json");
+    res.status = 200;
+    res.reason = "OK";
+}
+
+
+void NetWorkInterface::SetRobotRunParm(const CarAPIDevInfo &robot_info,RobotRunStatus &_run_status){
+    _run_status.linear_x = robot_info.speed.linear_speed;
+    _run_status.linear_w = robot_info.speed.angle_speed;
+    _run_status.alarminfo = robot_info.alarm_info.alarm_message;
+    _run_status.manual   = robot_info.car_model;
+    _run_status.work_model = robot_info.work_model;
+    _run_status.pose.x  = robot_info.pose.x;
+    _run_status.pose.y  = robot_info.pose.y;
+    _run_status.pose.th = robot_info.pose.z;
+    _run_status.power   = robot_info.power.power;
+    _run_status.release   = robot_info.realease;
+    _run_status.auto_charge = robot_info.auto_charge;
+    _run_status.tilter_info = robot_info.tilter_info;
+    _run_status.fork_status = robot_info.fork_status;
+    _run_status.steer   =robot_info.steer;
+    _run_status.field_status   =robot_info.field_status;
+    _run_status.last_field_status   =robot_info.last_field_status;
+    _run_status.suspend   = robot_info.suspend;
+    _run_status.retire   = robot_info.retire;
+    _run_status.load_status   = robot_info.load_status;
+    _run_status.local_task_progress   = robot_info.local_task_progress;
+    _run_status.map_id = robot_info.map_id;
+    _run_status.confidence_status = robot_info.confidence_status;
+    _run_status.ret_code = 0;
+}
+
+
+
+bool NetWorkInterface::GetMapFileName(const char*data, uint32_t data_len, uint32_t& rem_len){
+    if(map_name_length_ ==0){
+        if (data_len < sizeof(uint32_t)){
+            rem_len = data_len;
+            update_map_status_ = false;
+            return false;
+        }
+        map_name_length_ = *((uint32_t*)data);
+        data += sizeof(uint32_t);
+        data_len -= sizeof(uint32_t);
+    }
+    uint32_t tmp_len = map_name_length_ - map_name_index_;
+    if (data_len >= tmp_len){
+        map_file_name_.append(data,tmp_len);
+        data_len -= tmp_len;
+        rem_len = data_len;
+        map_name_index_ = 0;
+        map_yaml_index_ = 0;
+        map_pgm_index_ = 0;
+        map_info_index_ = 0;
+        map_id_index_ = 0;
+        data += tmp_len;
+    }else{
+        map_file_name_.append(data,data_len);
+        map_name_index_ += data_len;
+        rem_len = 0;
+        return false;
+    }
+    RXX_LOG_INFO("get map file name ok");
+    map_name_length_ = 0;
+    return true;
+}
+
+bool NetWorkInterface::GetMapFileId(const char*data, uint32_t data_len, uint32_t& rem_len){
+    if(map_id_length_ ==0){
+        if (data_len < sizeof(uint32_t)){
+            rem_len = data_len;
+            update_map_status_ = false;
+            return false;
+        }
+        map_id_length_ = *((uint32_t*)data);
+        data += sizeof(uint32_t);
+        data_len -= sizeof(uint32_t);
+    }
+    update_map_status_ = true;
+    uint32_t tmp_len = map_id_length_ - map_id_index_;
+    if (data_len >= tmp_len){
+        asycn_map_id_.append(data,tmp_len);
+        data_len -= tmp_len;
+        rem_len = data_len;
+        map_name_index_ = 0;
+        map_yaml_index_ = 0;
+        map_pgm_index_ = 0;
+        map_info_index_ = 0;
+        map_id_index_ = 0;
+        data += tmp_len;
+    }else{
+        asycn_map_id_.append(data,data_len);
+        map_id_index_ += data_len;
+        rem_len = 0;
+        return false;
+    }
+   
+    if(asycn_map_id_.empty()){
+        update_map_status_ = false;
+        RXX_LOG_WARN("get map id  is empty");
+    }else{
+        RXX_LOG_INFO("get map id  ok");
+    }
+    map_id_length_ = 0;
+    return true;
+}
+
+bool NetWorkInterface::WriteYamlFile(const char*data, uint32_t data_len,\
+                                     uint32_t& rem_len,bool update_type){
+  if (map_yaml_file_ == nullptr){
+    std::string _yaml_name =""; 
+    if(update_type == true){
+        _yaml_name = ui_file_path_+asycn_map_id_+".yaml";
+    }else{
+        _yaml_name = file_path_+asycn_map_id_+".yaml";
+    }
+    RXX_LOG_INFO("_yaml_name = %s",_yaml_name.c_str());
+    map_yaml_file_ = fopen(_yaml_name.c_str(), "wb");
+    if(map_yaml_file_ == nullptr){
+        RXX_LOG_ERROR("WriteYamlFile open failed");
+        update_map_status_ = false;
+        return false;
+    }
+  }
+  update_map_status_ = true;
+  if (map_yaml_length_ == 0){
+    if (data_len < sizeof(uint32_t)){
+      rem_len = data_len;
+      update_map_status_ = false;
+      return false;
+    }
+
+    map_yaml_length_ = *((uint32_t*)data);
+    data += sizeof(uint32_t);
+    data_len -= sizeof(uint32_t);
+  }
+  uint32_t tmp_len = map_yaml_length_ - map_yaml_index_;
+  if (data_len >= tmp_len){
+    if (map_yaml_file_ != nullptr)
+    {
+        int result = fwrite(data, tmp_len, 1, map_yaml_file_);
+        (void)result;
+    }
+    data_len -= tmp_len;
+    rem_len = data_len;
+    map_yaml_index_ = 0;
+    map_pgm_index_ = 0;
+    map_info_index_ = 0;
+    map_id_index_ = 0;
+    data += tmp_len;
+  }else{
+    if (map_yaml_file_ != nullptr){
+        int result = fwrite(data, data_len, 1, map_yaml_file_);
+        (void)result;
+    }
+    map_yaml_index_ += data_len;
+    rem_len = 0;
+    return false;
+  }
+  RXX_LOG_INFO("write yaml ok");
+  if (map_yaml_file_ != nullptr){
+    fclose(map_yaml_file_);
+    map_yaml_file_ = nullptr;
+  }
+
+  map_yaml_length_ = 0;
+  return true;
+}
+
+bool NetWorkInterface::WritePbstreamFile(const char*data, uint32_t data_len, uint32_t& rem_len, bool update_type)
+{
+    if (map_pbstream_file_ == nullptr){
+        std::string _pbstream_name = "";
+        if (update_type == true){
+            _pbstream_name = ui_file_path_ + asycn_map_id_ + ".pbstream";
+        }
+        else{
+            _pbstream_name = file_path_ + asycn_map_id_ + ".pbstream";
+        }
+        RXX_LOG_INFO("_pbstream_name = %s %d %d", _pbstream_name.c_str(), data_len, rem_len);
+        map_pbstream_file_ = fopen(_pbstream_name.c_str(), "wb");
+        if (map_pbstream_file_ == nullptr){
+            RXX_LOG_ERROR("WritepbstreamFile open failed");
+            update_map_status_ = false;
+            return false;
+        }
+    }
+    update_map_status_ = true;
+    if (map_pbstream_length_ == 0){
+        if (data_len < sizeof(uint32_t)){
+            rem_len = data_len;
+            update_map_status_ = false;
+            return false;
+        }
+        map_pbstream_length_ = *((uint32_t*)data);
+        data += sizeof(uint32_t);
+        data_len -= sizeof(uint32_t);
+    }
+
+    uint32_t tmp_len = map_pbstream_length_ - map_pbstream_index_;
+    if (data_len >= tmp_len){
+        if (map_pbstream_file_ != nullptr){
+            size_t ret = fwrite(data, tmp_len, 1, map_pbstream_file_);
+            (void)ret;
+        }
+        data_len -= tmp_len;
+        rem_len = data_len;
+        map_pbstream_index_ = 0;
+        map_info_index_ = 0;
+    }
+    else{
+        if (map_pbstream_file_ != nullptr){
+            size_t ret = fwrite(data, data_len, 1, map_pbstream_file_);
+            (void)ret;
+        }
+        map_pbstream_index_ += data_len;
+        rem_len = 0;
+        return false;
+    }
+
+
+    if (map_pbstream_file_ != nullptr){
+        fclose(map_pbstream_file_);
+        map_pbstream_file_ = nullptr;
+    }
+
+    RXX_LOG_INFO("write pbstream ok");
+    if (update_type == true){
+        auto result = fork();
+        if( result == 0){
+            setpgrp();
+            system("sync");
+            std::string _command = "cp " + ui_file_path_ + asycn_map_id_ + ".pbstream " +\
+                                    file_path_ + asycn_map_id_ +".pbstream";
+            RXX_LOG_INFO("pbstream update--->%s", _command.c_str());
+            system(_command.c_str());
+            _exit(0);
+        }else if( result < 0 ){
+            update_map_status_ = false;
+            return false;
+        }else{
+            int pid_status;
+            waitpid(result,&pid_status,0);
+        }
+    }
+    map_pbstream_length_ = 0;
+    return true;
+}
+
+bool NetWorkInterface::WritePgmFile(const char*data, uint32_t data_len,\
+                                     uint32_t& rem_len,bool update_type){
+  if (map_pgm_file_ == nullptr){
+    std::string _pgm_name =""; 
+    if(update_type == true){
+        _pgm_name = ui_file_path_+asycn_map_id_+".pgm";
+    }else{
+        _pgm_name = file_path_+asycn_map_id_+".pgm";
+    }
+    RXX_LOG_INFO("_pgm_name = %s",_pgm_name.c_str());
+    map_pgm_file_ = fopen(_pgm_name.c_str(), "wb");
+    if(map_pgm_file_ == nullptr){
+        RXX_LOG_ERROR("WritePgmFile open failed");
+        update_map_status_ = false;
+        return false;
+    }
+  }
+  update_map_status_ = true;
+  if (map_pgm_length_ == 0){
+    if (data_len < sizeof(uint32_t)){
+      rem_len = data_len;
+      update_map_status_ = false;
+      return false;
+    }
+    map_pgm_length_ = *((uint32_t*)data);
+    data += sizeof(uint32_t);
+    data_len -= sizeof(uint32_t);
+  }
+
+  uint32_t tmp_len = map_pgm_length_ - map_pgm_index_;
+  if (data_len >= tmp_len){
+    if (map_pgm_file_ != nullptr){
+        size_t ret = fwrite(data, tmp_len, 1, map_pgm_file_);
+        (void)ret;
+    }
+    data_len -= tmp_len;
+    rem_len = data_len;
+    map_pgm_index_ = 0;
+    map_info_index_ = 0;
+  }else{
+    if (map_pgm_file_ != nullptr){
+        size_t ret = fwrite(data, data_len, 1, map_pgm_file_);
+        (void)ret;
+    }
+    map_pgm_index_ += data_len;
+    rem_len = 0;
+    return false;
+  }
+
+
+  if (map_pgm_file_ != nullptr){
+    fclose(map_pgm_file_);
+    map_pgm_file_ = nullptr;
+  }
+  
+  RXX_LOG_INFO("write pgm ok");
+  if(update_type == true){
+    auto result = fork();
+    if( result == 0){
+        setpgrp();
+        system("sync");
+        std::string _command ="cp " +ui_file_path_+asycn_map_id_+".pgm "+\
+                                file_path_+ asycn_map_id_ + ".pgm";
+        RXX_LOG_INFO("pgm update--->%s",_command.c_str());
+        system(_command.c_str());
+        _command ="cp " +ui_file_path_+asycn_map_id_+".yaml "+\
+                        file_path_+ asycn_map_id_+".yaml";
+        RXX_LOG_INFO("yaml update--->%s",_command.c_str());
+        system(_command.c_str());
+        _exit(0);
+    }else if(result < 0){
+        update_map_status_ = false;
+        return false;
+    }else{
+        int pid_status;
+        waitpid(result,&pid_status,0);
+    }
+  }
+  map_pgm_length_ = 0;
+  return true;
+}
+
+bool NetWorkInterface::WriteMapFileToDatesBase(const char*data, uint32_t data_len,uint32_t& rem_len){
+    if( map_info_length_ ==0 ){
+        if (data_len < sizeof(uint32_t)){
+            rem_len = data_len;
+            update_datebase_status_ = false;
+            return false;
+        }
+        map_info_ = "";
+        map_info_length_ = *((uint32_t*)data);
+        data += sizeof(uint32_t);
+        data_len -= sizeof(uint32_t);
+    }
+    uint32_t tmp_len = map_info_length_ - map_info_index_;
+    if (data_len >= tmp_len){
+        map_info_.append(data,tmp_len);
+        data_len -= tmp_len;
+        rem_len = data_len;
+        data += tmp_len;
+        map_info_index_ = 0;
+    }else{
+        map_info_.append(data,data_len);
+        map_info_index_ += data_len;
+        rem_len = 0;
+        return false;
+    }
+
+    std::string _map_file_name = map_file_name_;
+    bool status = AnalyzeJson::GetInstance().JsonToRobotDateBaseMapInfo(map_info_,date_base_map_info_,db_third_party_devices,
+                                                                        db_wireless_tasks,db_safe_doors,db_robotarms,
+                                                                        db_elevators,db_alarmTactics);
+    date_base_map_info_.map_path = ui_file_path_;
+    if( status == true ){
+        UiDataBase::GetInstance().RemovMap(date_base_map_info_.id);
+        status = UiDataBase::GetInstance().AddMap(date_base_map_info_);
+        if(status == false){
+            RXX_LOG_ERROR("insert DB map failed");
+            update_datebase_status_ = false;
+        }
+        for(auto &iter:date_base_map_info_.site_list){
+            status = UiDataBase::GetInstance().AddPoint(iter);
+            if(status == false){
+                RXX_LOG_ERROR("insert DB Point failed");
+                update_datebase_status_ = false;
+                break;
+            }
+        }
+
+        for(auto &iter:date_base_map_info_.path_list){
+            status = UiDataBase::GetInstance().AddPath(iter);
+            if(status == false){
+                RXX_LOG_ERROR("insert DB Path failed");
+                update_datebase_status_ = false;
+                break;
+            }
+        }
+
+
+        for(auto &iter:date_base_map_info_.area_list){
+            status = UiDataBase::GetInstance().AddArea(iter);
+            if(status == false){
+                RXX_LOG_ERROR("insert DB Area failed");
+                update_datebase_status_ = false;
+                break;
+            }
+        }
+
+        for(auto &iter:date_base_map_info_.group_list){
+            status = UiDataBase::GetInstance().AddGroup(iter);
+            if(status == false){
+                RXX_LOG_ERROR("insert DB Group failed");
+                update_datebase_status_ = false;
+                break;
+            }
+        }
+
+        for(auto &iter:date_base_map_info_.path_area_list){
+            status = UiDataBase::GetInstance().AddPathArea(iter);
+            if(status == false){
+                RXX_LOG_ERROR("insert DB PathArea failed");
+                update_datebase_status_ = false;
+                break;
+            }
+        }
+
+        for(auto &iter:date_base_map_info_.reservoir_area_list){
+            status = UiDataBase::GetInstance().addReservoirArea(iter);
+            if(status == false){
+                RXX_LOG_ERROR("insert DB reservoir_area failed");
+                update_datebase_status_ = false;
+                break;
+            }
+        }
+
+        for(auto &iter:date_base_map_info_.combine_reservoir_list){
+            status = UiDataBase::GetInstance().addCombineReservoir(iter);
+            if(status == false){
+                RXX_LOG_ERROR("insert DB combine_reservoir failed");
+                update_datebase_status_ = false;
+                break;
+            }
+        }
+
+        for(auto &iter:date_base_map_info_.reflector_list){
+            status = UiDataBase::GetInstance().addReflector(iter);
+            if(status == false){
+                RXX_LOG_ERROR("insert DB reflector failed");
+                update_datebase_status_ = false;
+                break;
+            }
+        }
+
+        for(auto &iter:db_third_party_devices){
+            UiDataBase::GetInstance().removeThirdPartyDevice(iter);
+            status = UiDataBase::GetInstance().addThirdPartyDevice(iter);
+            if(status == false){
+                RXX_LOG_ERROR("insert DB third_party_dev failed");
+                update_datebase_status_ = false;
+                break;
+            }
+        }
+        RXX_LOG_WARN("**************%d",db_wireless_tasks.size());
+        for(auto &iter:db_wireless_tasks){
+            UiDataBase::GetInstance().removeWirelessDeviceTask(iter);
+            status = UiDataBase::GetInstance().addWirelessDeviceTask(iter);
+            if(status == false){
+                RXX_LOG_ERROR("insert DB wireless_dev_task failed");
+                update_datebase_status_ = false;
+                break;
+            }
+        }
+
+        for(auto &iter:db_safe_doors){
+            UiDataBase::GetInstance().removeSafeDoor(iter);
+            status = UiDataBase::GetInstance().addSafeDoor(iter);
+            if(status == false){
+                RXX_LOG_ERROR("insert DB safe_door failed");
+                update_datebase_status_ = false;
+                break;
+            }
+        }
+
+        RXX_LOG_WARN("**************%d",db_robotarms.size());
+        for(auto &iter:db_robotarms){
+            UiDataBase::GetInstance().removeRobotArm(iter);
+            status = UiDataBase::GetInstance().addRobotArm(iter);
+            if(status == false){
+                RXX_LOG_ERROR("insert DB robot_arm failed");
+                update_datebase_status_ = false;
+                break;
+            }
+        }
+
+        for(auto &iter:db_elevators){
+            UiDataBase::GetInstance().removeElevator(iter);
+            status = UiDataBase::GetInstance().addElevator(iter);
+            if(status == false){
+                RXX_LOG_ERROR("insert DB Elevator failed");
+                update_datebase_status_ = false;
+                break;
+            }
+        }
+
+        for(auto &iter:db_alarmTactics){
+            UiDataBase::GetInstance().removeAlarmMsgTactic(iter);
+            status = UiDataBase::GetInstance().addAlarmMsgTactic(iter);
+            if(status == false){
+                RXX_LOG_ERROR("insert DB alarmMsgTactic failed");
+                update_datebase_status_ = false;
+                break;
+            }
+        }
+
+        if( update_datebase_status_ == false){
+            map_info_length_ = 0;
+            RXX_LOG_ERROR("Write MapFile To DatesBase failed");
+            return true;
+        }
+        DBRobotCar robot_info;
+        status = UiDataBase::GetInstance().GetDefaultRebot(robot_info);
+        if(status == true){
+            // robot_info.robot_usemap_id = date_base_map_info_.id;
+            // UiDataBase::GetInstance().RemovRobot(robot_info);
+            // UiDataBase::GetInstance().AddRobot(robot_info);
+        }
+        if(update_datebase_status_ == true){
+            update_datebase_status_ = true;
+            RXX_LOG_INFO("Write MapFile To DatesBase ok");
+            UiDataBase::GetInstance().Start();
+        }
+
+    }else{
+        update_datebase_status_ = false;
+        RXX_LOG_WARN("Write MapFile To DatesBase failed");
+    }
+    map_info_ = "";
+    map_info_length_ = 0;
+    return true;
+}
+
+void NetWorkInterface::ResetMapInfo(void){
+    map_info_ = "";
+    map_info_length_ = 0;
+    map_info_index_ = 0;
+
+    map_pgm_length_ = 0;
+    map_pgm_index_ = 0;
+
+    map_pbstream_length_ = 0;
+    map_pbstream_index_ = 0;
+
+    map_yaml_length_ = 0;
+    map_yaml_index_ = 0;
+
+    map_id_length_ = 0;
+    map_id_index_ = 0;
+    asycn_map_id_ = "";
+
+    map_name_length_ = 0;
+    map_name_index_ = 0;
+    map_file_name_ = "";
+
+    update_datebase_status_ = true;
+    update_map_status_ = true;
+    map_cur_step_ = 0;
+}
+
+
+bool NetWorkInterface::UpdataMapping(const char*data, uint32_t data_len,uint32_t& rem_len,bool update_type){
+  bool bret = false;
+  rem_len = 0;
+  if(update_type == false){
+        if (map_cur_step_ == 0) {
+            bret = GetMapFileId(data, data_len, rem_len);
+            if (bret){
+                map_cur_step_ = 1;
+                bret = false;
+            }
+            if (rem_len > 0){
+                uint32_t index = data_len - rem_len;
+                data_len = rem_len;
+                data = data + index;
+                bret = WriteYamlFile(data, data_len, rem_len, update_type);
+                if (bret){
+                    map_cur_step_ = 2;
+                    bret = false;
+                }
+            }
+        }else if (map_cur_step_ == 1) {
+            bret = WriteYamlFile(data, data_len, rem_len,update_type);
+            if (bret){
+                map_cur_step_ = 2;
+                bret = false;
+            }
+            if (rem_len > 0){
+                uint32_t index = data_len - rem_len;
+                data_len = rem_len;
+                data = data + index;
+                bret = WritePgmFile(data, data_len, rem_len, update_type);
+                if (bret){
+                    map_cur_step_ = 3;
+                    bret = false;
+                }
+            }
+        }else if (map_cur_step_ == 2) {
+            bret = WritePgmFile(data, data_len, rem_len,update_type);
+            if (bret){
+                map_cur_step_ = 3;
+                bret = false;
+            }
+            if (rem_len > 0){
+                uint32_t index = data_len - rem_len;
+                data_len = rem_len;
+                data = data + index;
+                bret = WritePbstreamFile(data, data_len, rem_len, update_type);
+            }
+        }else if (map_cur_step_ == 3){
+            bret = WritePbstreamFile(data, data_len, rem_len, update_type);
+        }
+  }else{
+        if(map_cur_step_ == 0){
+            bret = GetMapFileName(data, data_len, rem_len);
+            if (bret){
+                map_cur_step_ = 1;
+                bret = false;
+            }
+            if (rem_len > 0){
+                uint32_t index = data_len - rem_len;
+                data_len = rem_len;
+                bret = GetMapFileId(data + index, data_len, rem_len);
+                if (bret){
+                    if(asycn_map_id_ == "office"){
+                        update_map_status_ = false;
+                        RXX_LOG_WARN("update map id is office not match");
+                    }
+                    map_cur_step_ = 2;
+                    bret = false;
+                }
+            }
+        }else if (map_cur_step_ == 1) {
+            bret = GetMapFileId(data, data_len, rem_len);
+            if (bret){
+                map_cur_step_ = 2;
+                bret = false;
+            }
+            if (rem_len > 0){
+                uint32_t index = data_len - rem_len;
+                data_len = rem_len;
+                bret = WriteYamlFile(data + index, data_len, rem_len,update_type);
+                if (bret){
+                    map_cur_step_ = 3;
+                    bret = false;
+                }
+            }
+        }else if (map_cur_step_ == 2) {
+            bret = WriteYamlFile(data, data_len, rem_len,update_type);
+            if (bret){
+                map_cur_step_ = 3;
+                bret = false;
+            }
+            if (rem_len > 0){
+                uint32_t index = data_len - rem_len;
+                data_len = rem_len;
+                bret = WritePgmFile(data + index, data_len, rem_len,update_type);
+                if (bret){
+                    map_cur_step_ = 4;
+                    bret = false;
+                }
+            }
+        }else if (map_cur_step_ == 3) {
+            bret = WritePgmFile(data, data_len, rem_len,update_type);
+            if (bret){
+                map_cur_step_ = 4;
+                bret = false;
+            }
+            if (rem_len > 0){
+                uint32_t index = data_len - rem_len;
+                data_len = rem_len;
+                bret = WritePbstreamFile(data + index, data_len, rem_len, update_type);
+                if (bret){
+                    map_cur_step_ = 5;
+                    bret = false;
+                }
+            }
+        }else if(map_cur_step_ == 4){
+          
+            bret = WritePbstreamFile(data, data_len, rem_len, update_type);
+            if (bret){
+                map_cur_step_ = 5;
+            }
+            if (rem_len > 0){
+                uint32_t index = data_len - rem_len;
+                data_len = rem_len;
+                bret = WriteMapFileToDatesBase(data + index, data_len, rem_len);
+            }
+        }else if (map_cur_step_ == 5){
+            bret = WriteMapFileToDatesBase(data, data_len, rem_len);
+        }
+  }
+
+    if (bret || \
+        update_map_status_ == false || \
+        update_datebase_status_ == false){
+        map_pgm_index_ = 0;
+        map_yaml_index_ = 0;
+        map_name_index_ = 0;
+        map_info_index_ = 0;
+        map_id_index_ = 0;
+        map_cur_step_ = 0;
+        map_file_name_ = "";
+        asycn_map_id_ = "";
+
+        map_name_length_ = 0;
+        map_id_length_ = 0;
+        map_yaml_length_ =0;
+        map_pgm_length_ =0;
+        map_pbstream_length_ =0;
+        map_info_length_ = 0;
+    }
+    return bret;
+}
+
+
+void NetWorkInterface::CreatBezier(MoveTaskCmd &task_command){
+    if(pickup_distance_extend_ < 0.05){
+        return;
+    }
+    auto target_pose = task_command.path_property.path.poses.back();
+    double target_angle = tf::getYaw(target_pose.pose.orientation);
+    double x_value = pickup_distance_extend_*cos(target_angle);
+    double y_value = pickup_distance_extend_*sin(target_angle); 
+    
+
+    ros::Time now = ros::Time::now();
+    std::vector<Bezier::Point> b_controlPoints;
+    Bezier::Point tmp_point;
+    tmp_point.x = target_pose.pose.position.x;
+    tmp_point.y = target_pose.pose.position.y;
+    b_controlPoints.emplace_back(tmp_point);
+    tmp_point.x = target_pose.pose.position.x - x_value;
+    tmp_point.y = target_pose.pose.position.y - y_value;
+    b_controlPoints.emplace_back(tmp_point);
+    Bezier::Bezier<1> tmp_bezier(b_controlPoints);
+
+    float all_lenght = tmp_bezier.length();
+    double intervals = all_lenght/0.05;
+    const float dt = 1.0f / (float)intervals;
+    float t = dt;
+    Bezier::Point p1 = tmp_bezier.valueAt(t);
+    Bezier::Point p2;
+    nav_msgs::Path path;
+    for (size_t i = 1; i < ceil(intervals); ++i){
+        p2 = tmp_bezier.valueAt(t+dt);
+        geometry_msgs::PoseStamped tmp_pose;
+        tmp_pose.header.stamp = ros::Time::now();
+        tmp_pose.header.frame_id = "map";
+        tmp_pose.pose.position.x = p1.x;
+        tmp_pose.pose.position.y = p1.y;
+        tmp_pose.pose.position.z = target_pose.pose.position.z;
+	
+        tmp_pose.pose.orientation = target_pose.pose.orientation;
+        path.poses.emplace_back(tmp_pose);
+        p1.set(p2);
+        t += dt;
+    }
+    p2 = tmp_bezier.valueAt(1.0);
+
+    geometry_msgs::PoseStamped tmp_pose;
+    tmp_pose.header.frame_id = "map";
+    tmp_pose.pose.position.x = p2.x;
+    tmp_pose.pose.position.y = p2.y;
+    tmp_pose.pose.position.z = target_pose.pose.position.z;
+    tmp_pose.pose.orientation = target_pose.pose.orientation;
+    path.poses.emplace_back(tmp_pose);
+    path.header.frame_id = "map";
+    path.header.stamp = now;
+
+    auto total_size =path.poses.size();
+    RXX_LOG_INFO("total insert path %d",total_size);
+    task_command.path_property.path.poses.pop_back();
+    task_command.path_property.path.poses.insert(task_command.path_property.path.poses.end(),path.poses.begin(),path.poses.end());
+    if(task_command.path_property.sensor_switch.size()){
+        task_command.path_property.sensor_switch.pop_back();
+    }
+    task_command.path_property.sensor_switch.insert(task_command.path_property.sensor_switch.end(),total_size,task_command.path_property.sensor_switch.back());
+    
+    if(task_command.path_property.sensor_weaken.size()){
+        task_command.path_property.sensor_weaken.pop_back();
+    }
+    task_command.path_property.sensor_weaken.insert(task_command.path_property.sensor_weaken.end(),total_size,task_command.path_property.sensor_weaken.back());
+
+    if(task_command.path_property.path_deviation.size()){
+        task_command.path_property.path_deviation.pop_back();
+    }
+    task_command.path_property.path_deviation.insert(task_command.path_property.path_deviation.end(),total_size,task_command.path_property.path_deviation.back());
+    
+    if(task_command.path_property.path_angleoffset.size()){
+        task_command.path_property.path_angleoffset.pop_back();
+    }
+    task_command.path_property.path_angleoffset.insert(task_command.path_property.path_angleoffset.end(),total_size,task_command.path_property.path_angleoffset.back());
+
+    if(task_command.path_property.navpointmode.size()){
+        task_command.path_property.navpointmode.pop_back();
+    }
+    task_command.path_property.navpointmode.insert(task_command.path_property.navpointmode.end(),total_size,task_command.path_property.navpointmode.back());
+
+    if(task_command.path_property.master_id.size()){
+        task_command.path_property.master_id.pop_back();
+    }
+    task_command.path_property.master_id.insert(task_command.path_property.master_id.end(),total_size,task_command.path_property.master_id.back());
+    
+    if(task_command.path_property.sub_id.size()){
+        task_command.path_property.sub_id.pop_back();
+    }
+    task_command.path_property.sub_id.insert(task_command.path_property.sub_id.end(),total_size,task_command.path_property.sub_id.back());
+}
+
+void NetWorkInterface::PickUpPathExtend(MoveTaskCmd &task_command){
+    if(task_command.work_site_type == RobotSiteType::ROBOT_SITE_NORMAL && \
+        (task_command.target_forktype == ForkControlType::FORK_CONTROL_SUB_STOP_UP || \
+        task_command.target_forktype == ForkControlType::FORK_CONTROL_TYPE_UP) && \
+        task_command.path_type == 2){
+        if(task_command.path_property.path.poses.empty()){
+            RXX_LOG_WARN("pickup extend path size is empty");
+            return;
+        }
+        CreatBezier(task_command);
+    }
+}
+
+
+void NetWorkInterface::LoadRobotUseMapId(void){
+    if(robot_api_ == nullptr){
+        RXX_LOG_ERROR("LoadRobotUseMapId  robot_api_ is nullptr");
+        return;
+    }
+    DBRobotCar robot_info;
+    UiDataBase::GetInstance().GetDefaultRebot(robot_info);
+    robot_api_->SetWorkMapId(robot_info.robot_usemap_id,true);
+}
+
+
+bool NetWorkInterface::InitHttpService(ros::NodeHandle &_node, const CarInfo& car_info)
+{
+    if (robot_dev_info_.robot_note == "xp")
+    {
+        robot_api_ = RbrainRobotApi::GetHandleByType(ROBOT_TYPE_XP, _node);
+    }else if (robot_dev_info_.robot_note == "xc")
+    {
+        robot_api_ = RbrainRobotApi::GetHandleByType(ROBOT_TYPE_XC, _node);
+    }else if (robot_dev_info_.robot_note == "xd")
+    {
+        robot_api_ = RbrainRobotApi::GetHandleByType(ROBOT_TYPE_XD, _node);
+    }
+    else
+    {
+        robot_api_ = RbrainRobotApi::GetHandleByType(ROBOT_TYPE_XP, _node);
+    }
+    if (robot_api_ == nullptr){
+        RXX_LOG_ERROR("RbrainRobotApi::GetHandleByType get fail");
+        return false;
+    }
+    LoadRobotUseMapId();
+    robot_api_->SetRobotParam(car_info);
+    local_controller_ = "";
+    local_thread_ = nullptr;
+    local_thread_ = new boost::thread(boost::bind(&NetWorkInterface::RobotSensorThreadRun,this));
+
+    http_srv_.set_base_dir("./");
+
+    http_srv_.Get("/rbrainrobot/get_status_info",std::bind(&NetWorkInterface::GetRobotDevStatusInfo,\
+                                                this,std::placeholders::_1,std::placeholders::_2));
+
+    http_srv_.Get("/rbrainrobot/get_control_info",std::bind(&NetWorkInterface::GetRobotControlInfo,\
+                                                this,std::placeholders::_1,std::placeholders::_2));
+
+    http_srv_.Get("/rbrainrobot/get_traffic_control_param",std::bind(&NetWorkInterface::GetRobotTrafficControlParam,\
+                                                this,std::placeholders::_1,std::placeholders::_2));
+
+    http_srv_.Get("/rbrainrobot/get_status_run",std::bind(&NetWorkInterface::GetRobotRunStatus,\
+                                                this,std::placeholders::_1,std::placeholders::_2));
+
+    http_srv_.Get("/rbrainrobot/get_map",std::bind(&NetWorkInterface::GetRobotMap,\
+                                                this,std::placeholders::_1,std::placeholders::_2));
+
+
+    http_srv_.Get("/rbrainrobot/get_task_status",std::bind(&NetWorkInterface::GetRobotTaskStatus,\
+                                                this,std::placeholders::_1,std::placeholders::_2));
+
+    http_srv_.Get("/rbrainrobot/get_laser_data",std::bind(&NetWorkInterface::GetRobotLaserData,\
+                                                this,std::placeholders::_1,std::placeholders::_2));
+
+    http_srv_.Get("/rbrainrobot/get_robot_path",std::bind(&NetWorkInterface::GetRobotRunPath,\
+                                                this,std::placeholders::_1,std::placeholders::_2));
+
+    http_srv_.Get("/rbrainrobot/get_cur_task_status",std::bind(&NetWorkInterface::GetRobotCurTaskInfo,\
+                                                this,std::placeholders::_1,std::placeholders::_2));
+
+    http_srv_.Get("/rbrainrobot/get_task_status_list",std::bind(&NetWorkInterface::GetRobotTaskInfoList,\
+                                                this,std::placeholders::_1,std::placeholders::_2));
+
+    httplib::Server::Handler request_function = std::bind(&NetWorkInterface::RequestRobotControl,\
+                                                this,std::placeholders::_1,std::placeholders::_2);
+    http_srv_.Post("/rbrainrobot/request_controller",request_function);
+
+    httplib::Server::Handler release_function = std::bind(&NetWorkInterface::ReleaseRobotControl,\
+                                                this,std::placeholders::_1,std::placeholders::_2);
+    http_srv_.Post("/rbrainrobot/release_controller",release_function);
+
+    httplib::Server::Handler init_function = std::bind(&NetWorkInterface::SetRobotInitPose,\
+                                                this,std::placeholders::_1,std::placeholders::_2);
+    http_srv_.Post("/rbrainrobot/set_init_pose",init_function);
+
+    httplib::Server::Handler velocity_function = std::bind(&NetWorkInterface::SetRobotRemoteVelocity,\
+                                                this,std::placeholders::_1,std::placeholders::_2);
+    http_srv_.Post("/rbrainrobot/set_remote_velocity",velocity_function);
+
+    httplib::Server::Handler fork_control_function = std::bind(&NetWorkInterface::SetRobotForkControl,\
+                                                           this,std::placeholders::_1,std::placeholders::_2);
+    http_srv_.Post("/rbrainrobot/set_fork_control",fork_control_function);
+
+    httplib::Server::Handler suspend_function = std::bind(&NetWorkInterface::SetRobotSuspend,\
+                                                this,std::placeholders::_1,std::placeholders::_2);
+    http_srv_.Post("/rbrainrobot/set_remote_suspend",suspend_function);
+    
+
+    httplib::Server::Handler charger_function = std::bind(&NetWorkInterface::SetRobotAutoCharge,\
+                                                this,std::placeholders::_1,std::placeholders::_2);
+    http_srv_.Post("/rbrainrobot/set_auto_charger",charger_function);
+
+    httplib::Server::Handler offline_function = std::bind(&NetWorkInterface::SetOfflineMapping,\
+                                                this,std::placeholders::_1,std::placeholders::_2);
+    http_srv_.Post("/rbrainrobot/set_offline_mapping",offline_function);
+
+    httplib::Server::HandlerWithContentReader map_function = std::bind(&NetWorkInterface::SetRobotMap,\
+                                                this,std::placeholders::_1,std::placeholders::_2,std::placeholders::_3);
+    http_srv_.Post("/rbrainrobot/set_robot_map",map_function);
+
+    httplib::Server::Handler online_function = std::bind(&NetWorkInterface::SetOnlineMapping,\
+                                                this,std::placeholders::_1,std::placeholders::_2);
+    http_srv_.Post("/rbrainrobot/set_online_mapping",online_function);
+
+    httplib::Server::Handler fix_path_function = std::bind(&NetWorkInterface::SetRobotFixPath,\
+                                                this,std::placeholders::_1,std::placeholders::_2);
+    http_srv_.Post("/rbrainrobot/set_fix_path",fix_path_function);
+
+    httplib::Server::Handler move_base_function = std::bind(&NetWorkInterface::SetRobotMoveBase,\
+                                                this,std::placeholders::_1,std::placeholders::_2);
+    http_srv_.Post("/rbrainrobot/set_free_path",move_base_function);
+
+    httplib::Server::Handler max_speed_function = std::bind(&NetWorkInterface::SetRobotMaxSpeed,\
+                                                this,std::placeholders::_1,std::placeholders::_2);
+    http_srv_.Post("/rbrainrobot/set_max_speed",max_speed_function);
+
+    httplib::Server::Handler stop_task_function = std::bind(&NetWorkInterface::StopTask, \
+        this, std::placeholders::_1, std::placeholders::_2);
+    http_srv_.Post("/rbrainrobot/stop_task", stop_task_function);
+
+    httplib::Server::Handler force_stop_task_function = std::bind(&NetWorkInterface::ForceStopTask, \
+        this, std::placeholders::_1, std::placeholders::_2);
+    http_srv_.Post("/rbrainrobot/robot_force_stop_task", force_stop_task_function);
+
+    httplib::Server::Handler sensor_detector_function = std::bind(&NetWorkInterface::SetRobotSensorDetector, \
+        this, std::placeholders::_1, std::placeholders::_2);
+    http_srv_.Post("/rbrainrobot/sensor_detector", sensor_detector_function);
+
+    httplib::Server::Handler function_code_function = std::bind(&NetWorkInterface::SetRobotFunctionCode, \
+        this, std::placeholders::_1, std::placeholders::_2);
+    http_srv_.Post("/rbrainrobot/set_function_code", function_code_function);
+
+    httplib::Server::HandlerWithContentReader aysc_map_function = std::bind(&NetWorkInterface::SetRobotSyncMapInfo,\
+                                                this,std::placeholders::_1,std::placeholders::_2,std::placeholders::_3);
+    http_srv_.Post("/rbrainrobot/set_robot_aysc_map",aysc_map_function);
+
+    httplib::Server::Handler aysc_param_function = std::bind(&NetWorkInterface::SetRobotSyncParamInfo,\
+                                                             this,std::placeholders::_1,std::placeholders::_2);
+    http_srv_.Post("/rbrainrobot/set_robot_aysc_param",aysc_param_function);
+
+    httplib::Server::Handler task_info_function = std::bind(&NetWorkInterface::SetRobotTaskInfo,\
+                                                this,std::placeholders::_1,std::placeholders::_2);
+    http_srv_.Post("/rbrainrobot/set_task_info",task_info_function);
+
+    http_srv_.Get("/rbrainrobot/get_cur_reflectors",std::bind(&NetWorkInterface::GetCurReflectors,\
+    this,std::placeholders::_1,std::placeholders::_2));
+
+    httplib::Server::Handler reflectorswitch_function = std::bind(&NetWorkInterface::SetReflectorSwitchStatus,\
+                                                this,std::placeholders::_1,std::placeholders::_2);
+    http_srv_.Post("/rbrainrobot/set_reflector_switchstatus",reflectorswitch_function);
+
+    httplib::Server::Handler deletereflector_function = std::bind(&NetWorkInterface::DeleteErrorReflector,\
+                                                this,std::placeholders::_1,std::placeholders::_2);
+    http_srv_.Post("/rbrainrobot/delete_error_reflector",deletereflector_function);
+
+    httplib::Server::Handler savereflector_function = std::bind(&NetWorkInterface::SaveReflectors,\
+                                                this,std::placeholders::_1,std::placeholders::_2);
+    http_srv_.Post("/rbrainrobot/save_reflectors",savereflector_function);
+	
+    httplib::Server::Handler request_swap_map = std::bind(&NetWorkInterface::RequestSwapMap,\
+                                                this,std::placeholders::_1,std::placeholders::_2);
+    http_srv_.Post("/rbrainrobot/request_swap_map",request_swap_map);
+
+    RXX_LOG_WARN("robot_ip ->%s   port_->%d",robot_ip_.c_str(),robot_port_);
+    bool status = http_srv_.listen(robot_ip_.c_str(),robot_port_);
+    RXX_LOG_INFO("robot api finish");
+    return true;
+}
+
+void NetWorkInterface::SetRobotParam(const CarInfo& car_info)
+{
+    if (robot_api_ == NULL)
+    {
+        RXX_LOG_ERROR("robot api is NULL");
+        return;
+    }
+    robot_api_->SetRobotParam(car_info);
+}
